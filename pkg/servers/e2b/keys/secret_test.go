@@ -424,10 +424,33 @@ func TestSecretKeyStorage_Refresh(t *testing.T) {
 	_, found = storage.LoadByKey(context.Background(), "stale")
 	assert.False(t, found)
 
+	storage.storeKey(&models.CreatedTeamAPIKey{ID: AdminKeyID, Key: "admin-key", Name: models.AdminTeamName})
+
+	// A transient read error keeps the keys that are already loaded.
+	failing := &getHookClient{
+		Client: c,
+		getHook: func(_ context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+			return errors.New("api server unavailable")
+		},
+	}
+	require.Error(t, storage.refresh(context.Background(), failing))
+	_, found = storage.LoadByKey(context.Background(), valid.Key)
+	assert.True(t, found)
+
+	// A deleted store revokes every key except the admin key.
 	require.NoError(t, c.Delete(context.Background(), &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: KeySecretName, Namespace: "default"},
 	}))
-	require.Error(t, storage.refresh(context.Background(), c))
+	err = storage.refresh(context.Background(), c)
+	require.True(t, apierrors.IsNotFound(err))
+	_, found = storage.LoadByKey(context.Background(), valid.Key)
+	assert.False(t, found)
+	_, found = storage.LoadByID(context.Background(), valid.ID.String())
+	assert.False(t, found)
+	_, found = storage.LoadByKey(context.Background(), "admin-key")
+	assert.True(t, found)
+	_, found = storage.idxByTeam.Load(models.AdminTeamName)
+	assert.True(t, found)
 }
 
 func TestSecretKeyStorage_PatchSecretKey(t *testing.T) {

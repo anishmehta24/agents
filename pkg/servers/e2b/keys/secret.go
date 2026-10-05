@@ -230,7 +230,22 @@ func (k *secretKeyStorage) refresh(ctx context.Context, reader client.Reader) er
 	log.Info("refreshing api-key store")
 	secret := &corev1.Secret{}
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: k.Namespace, Name: KeySecretName}, secret); err != nil {
-		return err
+		if !apierrors.IsNotFound(err) {
+			// Keep serving the current indexes on a transient read error, so an
+			// API server hiccup does not become an authentication outage.
+			return err
+		}
+		// The store is gone, so every key it held is revoked. Fail closed and keep
+		// only the admin key, which is never deleted.
+		ids, keys, teamNames := sets.NewString(), sets.NewString(), sets.NewString()
+		if value, ok := k.idxByID.Load(AdminKeyID.String()); ok {
+			admin := value.(*models.CreatedTeamAPIKey)
+			ids.Insert(AdminKeyID.String())
+			keys.Insert(admin.Key)
+			teamNames.Insert(admin.Team.Name)
+		}
+		k.pruneIndexes(ids, keys, teamNames)
+		return fmt.Errorf("api-key store secret not found, revoked all keys except the admin key: %w", err)
 	}
 	// refresh is the only path that mutates the in-memory indexes. CreateKey
 	// and DeleteKey intentionally only update the Secret and then wait for an
@@ -252,7 +267,12 @@ func (k *secretKeyStorage) refresh(ctx context.Context, reader client.Reader) er
 		}
 	}
 
-	// clean up out-dated keys
+	k.pruneIndexes(ids, keys, teamNames)
+	return nil
+}
+
+// pruneIndexes drops every index entry whose key, ID or team name is not in the given sets.
+func (k *secretKeyStorage) pruneIndexes(ids, keys, teamNames sets.String) {
 	k.idxByKey.Range(func(key, _ any) bool {
 		if !keys.Has(key.(string)) {
 			k.idxByKey.Delete(key)
@@ -271,7 +291,6 @@ func (k *secretKeyStorage) refresh(ctx context.Context, reader client.Reader) er
 		}
 		return true
 	})
-	return nil
 }
 
 // triggerRefresh uses refreshC, which is a buffered channel (cap=1), to coalesce refresh signals.
