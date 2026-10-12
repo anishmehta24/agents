@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -569,6 +570,63 @@ func TestReconciler_Reconcile_Timeout(t *testing.T) {
 	// Should not requeue
 	if result.Requeue || result.RequeueAfter > 0 {
 		t.Errorf("Should not requeue after completion, got %v", result)
+	}
+}
+
+func TestReconciler_Reconcile_SandboxSetGetError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = agentsv1alpha1.AddToScheme(scheme)
+
+	claim := &agentsv1alpha1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-claim",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: agentsv1alpha1.SandboxClaimSpec{
+			TemplateName: "test-sandboxset",
+		},
+		Status: agentsv1alpha1.SandboxClaimStatus{
+			Phase: agentsv1alpha1.SandboxClaimPhaseClaiming,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(claim).
+		WithStatusSubresource(&agentsv1alpha1.SandboxClaim{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*agentsv1alpha1.SandboxSet); ok {
+					return errors.NewServiceUnavailable("apiserver unavailable")
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	fakeRecorder := record.NewFakeRecorder(100)
+	reconciler := &Reconciler{
+		Client:   fakeClient,
+		Scheme:   scheme,
+		controls: core.NewClaimControl(fakeClient, fakeRecorder, nil, nil),
+		recorder: fakeRecorder,
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace},
+	})
+	if !errors.IsServiceUnavailable(err) {
+		t.Fatalf("Reconcile() error = %v, want the SandboxSet get error", err)
+	}
+
+	updatedClaim := &agentsv1alpha1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(),
+		types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}, updatedClaim); err != nil {
+		t.Fatalf("Failed to get updated claim: %v", err)
+	}
+	if updatedClaim.Status.Phase != agentsv1alpha1.SandboxClaimPhaseClaiming {
+		t.Errorf("phase = %v, want Claiming (a transient error must not complete the claim)", updatedClaim.Status.Phase)
 	}
 }
 
